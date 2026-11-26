@@ -4317,10 +4317,12 @@ fn make_twinned(
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
-            if crate::port_cbv::on() {
+            if crate::port_cbv::on() && twin.is_some() {
                 // Renderer port 5: shaders read constant buffers as raw bytes
                 // through the twin; a constant buffer view there would be read
-                // raw, with no end on AMD.
+                // raw, with no end on AMD. On hosts without raw twins (NVIDIA's
+                // 1,000,000-descriptor cap), shaders read CBVs through the
+                // primary slot, so we must not turn non-256B CBVs into nulls.
                 return constant_twinned(&shadow.buffer, gpu, size, at, twin).then(|| Some(shadow.buffer.clone()));
             }
             if gpu % 256 != 0 {

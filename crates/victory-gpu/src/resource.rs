@@ -1295,10 +1295,22 @@ fn video_memory_percent() -> u64 {
     pct
 }
 
+/// Whether the host GPU has a large VRAM budget (>= 18 GiB, e.g. 24 GB cards
+/// like the RTX 4090 or RX 7900 XTX). Cached once from DXGI.
+#[cfg(windows)]
+fn high_vram_card() -> bool {
+    static HIGH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HIGH.get_or_init(|| {
+        crate::host::host()
+            .and_then(|h| h.video_memory())
+            .is_some_and(|[budget, ..]| budget >= (18u64 << 30))
+    })
+}
+
 /// How many of a streamed placed 2D texture's largest mips to skip so no side
-/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
-/// of the VRAM budget and 256 from 97 %, after `VIctory-vitesse` 7ada43b6).
-/// Keeps 16 GB cards from filling VRAM and stalling thousands of textures.
+/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset on <=16 GB cards: 1024,
+/// then 512 from 92 % of the VRAM budget and 256 from 97 %; unset on >=20 GB
+/// cards: uncapped below 88 %, then 2048, 1024 from 93 %, 512 from 97 %).
 #[cfg(windows)]
 fn over_cap(desc: &ResourceDesc) -> u32 {
     static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1310,11 +1322,20 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
     if set == Some(0) {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..92 => 1024,
-        92..97 => 512,
-        _ => 256,
-    });
+    let max = match set {
+        Some(limit) => limit,
+        None if high_vram_card() => match video_memory_percent() {
+            0..88 => return 0,
+            88..93 => 2048,
+            93..97 => 1024,
+            _ => 512,
+        },
+        None => match video_memory_percent() {
+            0..92 => 1024,
+            92..97 => 512,
+            _ => 256,
+        },
+    };
     let mut skip = 0u32;
     while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
         if skip + 1 >= u32::from(desc.mip_levels) {

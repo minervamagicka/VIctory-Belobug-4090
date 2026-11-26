@@ -298,6 +298,21 @@ fn is_fsr_4_1_2(name: &str) -> bool {
         .is_some_and(|suffix| !suffix.starts_with(|c: char| c.is_ascii_digit()))
 }
 
+/// Parses a dotted numeric prefix like `"4.1.2"` or `"3.1.4"` for version
+/// comparison so we pick FSR 4.1.2 when available (AMD RDNA 4) and otherwise
+/// fall back to the newest FSR 3.1.x / 3.x provider on NVIDIA and other GPUs.
+fn version_key(name: &str) -> (u32, u32, u32) {
+    let mut parts = name
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u32>().ok());
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
 /// The SDK supplies the version id to put in the context creation chain.
 fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String), String> {
     let mut count = 0u64;
@@ -330,7 +345,7 @@ fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String)
             "upscaler version names could not be queried (code {code})"
         ));
     }
-    let mut available = Vec::new();
+    let mut available: Vec<(u64, String)> = Vec::new();
     for (id, name) in ids.into_iter().zip(names).take(count as usize) {
         if !name.is_null() {
             // SAFETY: NUL-terminated name owned by the SDK.
@@ -340,13 +355,20 @@ fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String)
             if is_fsr_4_1_2(&name) {
                 return Ok((id, name));
             }
-            available.push(name);
+            available.push((id, name));
         }
     }
-    Err(format!(
-        "no FSR 4.1.2 provider for this adapter (available: {})",
-        available.join(", ")
-    ))
+    if let Some((id, name)) = available
+        .into_iter()
+        .max_by_key(|(_, name)| version_key(name))
+    {
+        tracing::info!(
+            provider = %name,
+            "FidelityFX: FSR 4.1.2 unavailable on this adapter; falling back to highest available provider"
+        );
+        return Ok((id, name));
+    }
+    Err("no FidelityFX upscaler provider found for this adapter".to_owned())
 }
 
 /// Puts the host backend after the title's upscaler description, in place
@@ -440,14 +462,13 @@ extern "C" fn ffxCreateContext(
     // SAFETY: a NUL-terminated name the DLL keeps, if any.
     let name = (!version.name.is_null())
         .then(|| unsafe { CStr::from_ptr(version.name) }.to_string_lossy());
-    if query_code != OK
-        || version.id != host.provider_id
-        || !name.as_deref().is_some_and(is_fsr_4_1_2)
-    {
+    if query_code != OK || version.id != host.provider_id {
         tracing::warn!(
             query_code,
             provider = name.as_deref().unwrap_or("?"),
-            "FidelityFX created a different provider than the requested 4.1.2"
+            expected_id = format_args!("{:#x}", host.provider_id),
+            actual_id = format_args!("{:#x}", version.id),
+            "FidelityFX created a different provider than requested"
         );
         // SAFETY: the PC provider just created the context with this allocator.
         unsafe { (host.destroy)(context, memory) };

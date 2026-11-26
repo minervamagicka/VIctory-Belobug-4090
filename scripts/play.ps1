@@ -2,7 +2,8 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
-# -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance)
+# -Fsr4K        PC FidelityFX upscaler at 3840x2160 (quality, balanced or performance; FSR 3.1.x on NVIDIA / FSR 4.1.2 on RDNA 4)
+# -Nvidia       prefer NVIDIA adapter and 24 GB RTX defaults (add -More @{VICTORY_GROUP_SYNC='1'} if a compute barrier hangs)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
@@ -10,6 +11,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$Nvidia,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
@@ -24,6 +26,10 @@ if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
+}
+if ($Nvidia) {
+    $settings.VICTORY_D3D12_ADAPTER = 'NVIDIA'
+    $settings.VICTORY_TEXTURE_MAX = '0'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
