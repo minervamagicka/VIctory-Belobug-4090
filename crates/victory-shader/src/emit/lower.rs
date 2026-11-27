@@ -1126,13 +1126,18 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    // A region that reads and writes LDS is still taken when it only raises flags
-    // (`lds_flag_region`): a read that misses the other host wave's write changes nothing
-    // the region leaves behind.
+    // A region that reads and writes LDS is still taken when:
+    // - its reads and writes hit disjoint constant LDS addresses (`lds_disjoint_region`),
+    // - at most one lane of the console wave can enter it (`lds_single_lane_region`), or
+    // - it only raises flags (`lds_flag_region`): a read that misses the other host wave's
+    //   write changes nothing the region leaves behind.
     let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
     for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
         let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
-        if !(flags_on && lds_flag_region(p, st, &blocks)) {
+        if !(lds_disjoint_region(p, st, &blocks)
+            || lds_single_lane_region(p, st, all, &blocks)
+            || (flags_on && lds_flag_region(p, st, &blocks)))
+        {
             return None;
         }
     }
@@ -1149,6 +1154,192 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     Some(meet)
+}
+
+/// Whether every LDS access in `blocks` hits a known constant byte range and no byte read
+/// in `blocks` is ever written in `blocks`. Then no read in the region can observe a write
+/// from the other host wave in the same region; group barriers at the region's edges order
+/// it with the rest of the program.
+fn lds_disjoint_region(p: &Program, st: &Structured, blocks: &[usize]) -> bool {
+    let mut def: HashMap<Value, (usize, usize)> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, v) in &inst.writes {
+                def.insert(v, (b, i));
+            }
+        }
+    }
+    let inline = |op: &Operand| -> Option<u32> {
+        match *op {
+            Operand::Const(c @ 128..=192) => Some(u32::from(c) - 128),
+            Operand::Const(c @ 193..=208) => Some((-(i32::from(c) - 192)) as u32),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        }
+    };
+    let constant = |v: Option<Value>, at: (usize, usize)| -> Option<u32> {
+        let (b, i) = *def.get(&v?)?;
+        let inst = &p.blocks[b].insts[i];
+        if inst.name() != "v_mov_b32" {
+            return None;
+        }
+        let guard = st.guards.get(b).and_then(|g| g.get(i)).copied().flatten();
+        let same = guard.is_none() || (b == at.0 && guard == st.guards[at.0][at.1]);
+        let Fields::Valu(valu) = &inst.fields else { return None };
+        if !same || valu.dpp.is_some() || valu.sdwa.is_some() {
+            return None;
+        }
+        inline(valu.src.first()?)
+    };
+    let mut read_bytes: HashSet<u32> = HashSet::new();
+    let mut write_bytes: HashSet<u32> = HashSet::new();
+    let mark_bytes = |set: &mut HashSet<u32>, at: u32, len: u32| {
+        for k in 0..len {
+            set.insert(at.wrapping_add(k));
+        }
+    };
+    for &b in blocks {
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            let name = inst.name();
+            let Fields::Ds { addr, offset0, offset1, gds, .. } = &inst.fields else {
+                if name.starts_with("ds_") {
+                    return false;
+                }
+                continue;
+            };
+            if name.starts_with("ds_swizzle") || name.contains("permute") {
+                continue;
+            }
+            if *gds {
+                return false;
+            }
+            let Some(Operand::Vector { reg, .. }) = *addr else { return false };
+            let Some(base) = constant(inst.read(Reg::V(reg)), (b, i)) else { return false };
+            let off16 = u32::from(*offset0) | u32::from(*offset1) << 8;
+            let target = if name.starts_with("ds_read") { &mut read_bytes } else { &mut write_bytes };
+            match name {
+                "ds_read_b32"
+                | "ds_write_b32"
+                | "ds_add_u32"
+                | "ds_add_rtn_u32"
+                | "ds_sub_u32"
+                | "ds_sub_rtn_u32"
+                | "ds_min_i32"
+                | "ds_min_u32"
+                | "ds_max_i32"
+                | "ds_max_u32"
+                | "ds_min_rtn_i32"
+                | "ds_min_rtn_u32"
+                | "ds_max_rtn_i32"
+                | "ds_max_rtn_u32"
+                | "ds_and_b32"
+                | "ds_and_rtn_b32"
+                | "ds_or_b32"
+                | "ds_or_rtn_b32"
+                | "ds_xor_b32"
+                | "ds_xor_rtn_b32" => mark_bytes(target, base.wrapping_add(off16), 4),
+                "ds_read2_b32" | "ds_write2_b32" => {
+                    mark_bytes(target, base.wrapping_add(u32::from(*offset0) * 4), 4);
+                    mark_bytes(target, base.wrapping_add(u32::from(*offset1) * 4), 4);
+                }
+                "ds_read_b64" | "ds_write_b64" => mark_bytes(target, base.wrapping_add(off16), 8),
+                _ => return false,
+            }
+        }
+    }
+    !read_bytes.is_empty() && !write_bytes.is_empty() && read_bytes.is_disjoint(&write_bytes)
+}
+
+/// Whether every LDS-accessing block in `blocks` can be entered by at most one lane of a
+/// 64-lane console wave (e.g. `v0 == k` or `(s << shift) + v0 == k` with `shift >= 6`).
+/// Only one of the two 32-lane host waves can ever execute such a region, so there is no
+/// cross-host-wave LDS race inside it; group barriers at its edges are sufficient.
+fn lds_single_lane_region(p: &Program, st: &Structured, _all: &[bool], blocks: &[usize]) -> bool {
+    let mut def: HashMap<Value, (usize, usize)> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, v) in &inst.writes {
+                def.insert(v, (b, i));
+            }
+        }
+    }
+    let inline = |op: &Operand| -> Option<u32> {
+        match *op {
+            Operand::Const(c @ 128..=192) => Some(u32::from(c) - 128),
+            Operand::Const(c @ 193..=208) => Some((-(i32::from(c) - 192)) as u32),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        }
+    };
+    let is_entry_v0 = |op: &Operand, inst: &Inst| -> bool {
+        matches!(*op, Operand::Vector { reg: 0, .. })
+            && inst.read(Reg::V(0)).is_some_and(|v| !def.contains_key(&v))
+    };
+    // Whether `op` (read by `inst`) uniquely determines the low 6 bits of the thread's
+    // entry `v0` (either entry `v0` itself, or `v_lshl_add_u32(scalar, shift >= 6, entry v0)`).
+    let identifies_lane = |op: &Operand, inst: &Inst| -> bool {
+        if is_entry_v0(op, inst) {
+            return true;
+        }
+        let Operand::Vector { reg, .. } = *op else { return false };
+        let Some(v) = inst.read(Reg::V(reg)) else { return false };
+        let Some(&(db, di)) = def.get(&v) else { return false };
+        let d = &p.blocks[db].insts[di];
+        if d.name() != "v_lshl_add_u32" {
+            return false;
+        }
+        let Fields::Valu(valu) = &d.fields else { return false };
+        valu.dpp.is_none()
+            && valu.sdwa.is_none()
+            && valu.src.len() == 3
+            && matches!(valu.src[0], Operand::Scalar { .. })
+            && inline(&valu.src[1]).is_some_and(|shift| shift >= 6)
+            && is_entry_v0(&valu.src[2], d)
+    };
+    // Whether `atom` is `v_cmp_eq_u32` comparing a constant against a lane-identifying VGPR.
+    let single_lane_atom = |atom: Atom| -> bool {
+        let Atom::Lane(v) = atom else { return false };
+        let Some(&(cb, ci)) = def.get(&v) else { return false };
+        let cmp = &p.blocks[cb].insts[ci];
+        if cmp.name() != "v_cmp_eq_u32" {
+            return false;
+        }
+        let Fields::Valu(valu) = &cmp.fields else { return false };
+        if valu.dpp.is_some() || valu.sdwa.is_some() || valu.src.len() < 2 {
+            return false;
+        }
+        (inline(&valu.src[0]).is_some() && identifies_lane(&valu.src[1], cmp))
+            || (inline(&valu.src[1]).is_some() && identifies_lane(&valu.src[0], cmp))
+    };
+    // Collect atoms forced to `true` by BDD `cond` (every path to `TRUE` takes the `hi` branch).
+    let implies_single_lane = |mut cond: crate::structure::Bool| -> bool {
+        while let Some((atom, lo, hi)) = st.bools.node(cond) {
+            if lo == crate::structure::Bool::FALSE {
+                if single_lane_atom(atom) {
+                    return true;
+                }
+                cond = hi;
+            } else {
+                break;
+            }
+        }
+        false
+    };
+    let mut saw_lds = false;
+    for &b in blocks {
+        let has_lds = p.blocks[b].insts.iter().any(|inst| {
+            matches!(inst.fields, Fields::Ds { .. })
+                && !(inst.name().starts_with("ds_swizzle") || inst.name().contains("permute"))
+        });
+        if !has_lds {
+            continue;
+        }
+        saw_lds = true;
+        if !implies_single_lane(st.reach[b]) {
+            return false;
+        }
+    }
+    saw_lds
 }
 
 /// Whether a lane-branch region (`blocks`, see [`lds_meetings`]) that both reads and writes
