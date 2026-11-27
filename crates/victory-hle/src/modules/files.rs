@@ -142,6 +142,32 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     out
 }
 
+/// True when `path` (without `\\?\`) already begins with `root` on a folder
+/// boundary — for instance when the title sit on a host `G:\...` drive that
+/// is also mounted as virtual `G:`, asks `GetModuleFileNameW` for its own
+/// path, and hands that host path back to a file API.
+fn starts_with_root(path: &[u16], root: &[u16]) -> bool {
+    if root.len() <= 3 || path.len() < root.len() {
+        return false;
+    }
+    let same_unit = |a: u16, b: u16| {
+        if SEPARATORS.contains(&a) && SEPARATORS.contains(&b) {
+            return true;
+        }
+        match (u8::try_from(a), u8::try_from(b)) {
+            (Ok(x), Ok(y)) => x.eq_ignore_ascii_case(&y),
+            _ => a == b,
+        }
+    };
+    path[..root.len()]
+        .iter()
+        .zip(root)
+        .all(|(&a, &b)| same_unit(a, b))
+        && path
+            .get(root.len())
+            .is_none_or(|c| SEPARATORS.contains(c))
+}
+
 /// The host path, NUL-terminated, for `path` (without its NUL) if it is on
 /// a virtual drive.
 pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
@@ -159,6 +185,15 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let letter = u16::from(letter.to_ascii_uppercase());
     let drives = drives();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
+    if starts_with_root(rest, root) {
+        let tail = &rest[root.len()..];
+        if prefix.is_empty() && rest.len() >= LONG {
+            let mut out = verbatim(root, tail);
+            out.push(0);
+            return Some(out);
+        }
+        return None;
+    }
     let tail = &rest[2..];
     if prefix.is_empty() && root.len() + tail.len() >= LONG {
         let mut out = verbatim(root, tail);
@@ -1016,5 +1051,23 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn host_paths_under_same_letter_mount_are_not_doubled() {
+        mount_at('G', Path::new(r"G:\SteamLibrary\steamapps\common\GTA-6"));
+        let tr = |s: &str| translate(&w(s)[..s.encode_utf16().count()]).map(|v| text(&v));
+        assert_eq!(
+            tr(r"G:\appdata0.rpf"),
+            Some(r"G:\SteamLibrary\steamapps\common\GTA-6\appdata0.rpf".into())
+        );
+        assert_eq!(
+            tr(r"G:\SteamLibrary\steamapps\common\GTA-6\game_scarlett_master.exe"),
+            None
+        );
+        assert_eq!(
+            tr(r"g:/steamlibrary/steamapps/common/gta-6/common.rpf"),
+            None
+        );
     }
 }
