@@ -405,9 +405,13 @@ impl CpuMeter {
             self.cores_pct.clear();
             let mut sum = 0.0f32;
             for (&(pi, pt), &(ni, nt)) in self.prev.iter().zip(&now) {
-                let dt = (nt - pt).max(1) as f32;
-                let di = (ni - pi).clamp(0, nt - pt) as f32;
-                let busy = ((1.0 - di / dt) * 100.0).clamp(0.0, 100.0);
+                let dt_ticks = nt.saturating_sub(pt).max(0);
+                let busy = if dt_ticks > 0 {
+                    let di = ni.saturating_sub(pi).clamp(0, dt_ticks) as f32;
+                    ((1.0 - di / dt_ticks as f32) * 100.0).clamp(0.0, 100.0)
+                } else {
+                    0.0
+                };
                 self.cores_pct.push(busy);
                 sum += busy;
             }
