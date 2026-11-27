@@ -1522,4 +1522,145 @@ pub(crate) mod tests {
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
+
+    /// Live hardware probe for shared-memory openings, ReBAR (`GPU_UPLOAD`),
+    /// and >65,535 X-group `ExecuteIndirect` dispatches on the host GPU.
+    #[test]
+    #[ignore = "live GPU hardware probe: cargo test -p victory-gpu rtx_hardware_probe -- --ignored --nocapture"]
+    fn rtx_hardware_probe() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host GPU");
+            return;
+        };
+        let device = &host.device;
+        let probe = probe(device, &|| host.video_memory(), 64);
+        for line in &probe.lines {
+            println!("inplace probe: {line}");
+        }
+
+        // Check D3D12_OPTIONS16 (Resizable BAR / GPU_UPLOAD heap support).
+        unsafe {
+            let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            let ok16 = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut o16).cast(),
+                    size_of_val(&o16) as u32,
+                )
+                .is_ok();
+            println!(
+                "options16 (ok={ok16}): DynamicDepthBiasSupported={}, GPUUploadHeapSupported={}",
+                o16.DynamicDepthBiasSupported.as_bool(),
+                o16.GPUUploadHeapSupported.as_bool(),
+            );
+
+            if o16.GPUUploadHeapSupported.as_bool()
+                && let Ok(mut rig) = Rig::new(device)
+            {
+                let bytes = 64u64 << 20;
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+                    ..Default::default()
+                };
+                let mut buf: Option<ID3D12Resource> = None;
+                let created = device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &buffer_desc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buf,
+                );
+                println!("GPU_UPLOAD 64 MB UAV buffer creation: {}", hr(&created));
+                if let Some(buf) = buf {
+                    let mut ptr = std::ptr::null_mut();
+                    if buf.Map(0, None, Some(&mut ptr)).is_ok() {
+                        let t0 = std::time::Instant::now();
+                        std::ptr::write_bytes(ptr.cast::<u8>(), 0x2A, bytes as usize);
+                        let cpu_write_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        ptr.cast::<[u32; 3]>().write([100, 23, 0]);
+                        let shaded = rig.shade(buf.GetGPUVirtualAddress());
+                        let sum = ptr.cast::<[u32; 3]>().read()[2];
+                        let gpu_copy_ms = rig.copy_ms(&buf, bytes).ok();
+                        buf.Unmap(0, None);
+                        println!(
+                            "GPU_UPLOAD 64 MB: CPU write {cpu_write_ms:.2} ms ({:.1} GB/s), GPU UAV shader write visible to CPU={} (sum={sum}, {}), GPU->VRAM copy {:?} ms",
+                            64.0 / cpu_write_ms / 1.024,
+                            sum == 123,
+                            hr(&shaded),
+                            gpu_copy_ms,
+                        );
+                    }
+                }
+            }
+
+            // Probe ExecuteIndirect Dispatch with 115,200 groups in X (> 65,535).
+            if let Ok(mut rig) = Rig::new(device) {
+                const CS: &str = "#define RS \"UAV(u0)\"\nRWByteAddressBuffer hits : register(u0);\n[RootSignature(RS)]\n[numthreads(1, 1, 1)]\nvoid main() { uint prev; hits.InterlockedAdd(0, 1, prev); }\n";
+                let mut code: Option<ID3DBlob> = None;
+                D3DCompile(CS.as_ptr().cast(), CS.len(), s!("wide"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None).unwrap();
+                let code = code.unwrap();
+                let slice = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let root: ID3D12RootSignature = device.CreateRootSignature(0, slice).unwrap();
+                let pso: ID3D12PipelineState = device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: slice.as_ptr().cast(), BytecodeLength: slice.len() },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let arg_desc = D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                    ..Default::default()
+                };
+                let mut sig: Option<ID3D12CommandSignature> = None;
+                device
+                    .CreateCommandSignature(
+                        &D3D12_COMMAND_SIGNATURE_DESC {
+                            ByteStride: 12,
+                            NumArgumentDescs: 1,
+                            pArgumentDescs: &arg_desc,
+                            NodeMask: 0,
+                        },
+                        None,
+                        &mut sig,
+                    )
+                    .unwrap();
+                let sig = sig.unwrap();
+
+                let args = rig.committed(D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_STATE_GENERIC_READ).unwrap();
+                let mut p = std::ptr::null_mut();
+                args.Map(0, None, Some(&mut p)).unwrap();
+                p.cast::<[u32; 3]>().write([115_200, 1, 1]);
+                args.Unmap(0, None);
+
+                let mut hits: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &buffer_desc(256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut hits,
+                    )
+                    .unwrap();
+                let hits = hits.unwrap();
+                rig.store(&hits, 0, &[0u8; 16]).unwrap();
+
+                let ran = rig.run(|list| {
+                    list.SetComputeRootSignature(&root);
+                    list.SetPipelineState(&pso);
+                    list.SetComputeRootUnorderedAccessView(0, hits.GetGPUVirtualAddress());
+                    list.ExecuteIndirect(&sig, 1, &args, 0, None, 0);
+                });
+                let got = rig.fetch(&hits, 0, 4).ok().map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+                println!(
+                    "ExecuteIndirect(115200, 1, 1): run={}, groups_executed={:?}",
+                    hr(&ran),
+                    got,
+                );
+            }
+        }
+    }
 }
