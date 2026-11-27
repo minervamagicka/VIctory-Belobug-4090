@@ -3481,6 +3481,10 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
+            // Capped 1M heaps (NVIDIA) have no raw twin region; under renderer
+            // port 5 (`VICTORY_PORT_CBV=1`), tables with a declared CBV read
+            // constant buffers as raw SRVs directly in their dynamic slots.
+            let raw_cbv = crate::port_cbv::on() && !host.has_raw_twins() && group.has_cbv;
             // The table and what its entries hold (record words).
             let key = {
                 let mut h = RecordHash::default();
@@ -3489,7 +3493,8 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
                 }
-                (table, n, h.0)
+                let hash = if raw_cbv { h.0 ^ 0x9e37_79b9_7f4a_7c15 } else { h.0 };
+                (table, n, hash)
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
@@ -3621,7 +3626,7 @@ impl State {
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
-                        if crate::port_cbv::in_place_on() {
+                        if (host.has_raw_twins() || raw_cbv) && crate::port_cbv::in_place_on() {
                             match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
                                 Some(shadow) => {
                                     if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
@@ -3634,12 +3639,16 @@ impl State {
                             }
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                            host.make_null(index);
+                            if raw_cbv {
+                                host.null_raw_at(index);
+                            } else {
+                                host.make_null(index);
+                            }
                             continue;
                         };
-                        let slot = (std::ptr::from_ref(heap) as usize, index);
+                        let slot = (std::ptr::from_ref(heap) as usize, index, raw_cbv);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
-                        host.constant_at(index, &buffer, gpu, size);
+                        host.constant_slot_at(index, &buffer, gpu, size, raw_cbv);
                     }
                     Some(view) => {
                         host.make_at(index, &view);

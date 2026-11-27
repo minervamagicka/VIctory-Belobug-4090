@@ -893,13 +893,14 @@ pub(crate) fn constant_slot(
     buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     gpu: u64,
     size: u32,
+    raw_only: bool,
 ) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.constant_at(index, buffer, gpu, size);
+        host.constant_slot_at(index, buffer, gpu, size, raw_only);
     }
 }
 

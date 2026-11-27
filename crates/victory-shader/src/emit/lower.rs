@@ -7414,16 +7414,29 @@ impl<'a> Lower<'a> {
             }
             return Ok(None);
         }
-        if super::shader::raw_views() == 0 {
-            return Ok(None);
-        }
+        let has_twins = super::shader::raw_views() != 0;
         let x = self.x;
         let scalar = &self.scalar;
         let through_heap = src.leaves().iter().all(|leaf| match leaf {
             Source::Loaded { load, .. } | Source::Fetched { load, .. } => scalar
                 .get(load)
                 .and_then(|a| x.native.layout.get(a.param))
-                .is_some_and(|p| matches!(p.root, RootType::Table | RootType::ResourceHeap)),
+                .is_some_and(|p| {
+                    if has_twins {
+                        matches!(p.root, RootType::Table | RootType::ResourceHeap)
+                    } else {
+                        // Capped 1M host heaps (NVIDIA) have no raw twin region,
+                        // but every table with a declared CBV (`group.has_cbv`)
+                        // is snapshotted into fresh dynamic slots for the draw,
+                        // where the host places a raw SRV directly in the slot.
+                        p.root == RootType::Table
+                            && x.native.used.iter().any(|u| {
+                                u.root == RootType::Table
+                                    && u.slot == p.slot
+                                    && u.kind == ResourceType::Cbv
+                            })
+                    }
+                }),
             _ => false,
         });
         if !through_heap {

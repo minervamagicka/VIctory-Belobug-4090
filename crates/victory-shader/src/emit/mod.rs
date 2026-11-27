@@ -2481,6 +2481,70 @@ mod tests {
             let got = out.iter().find(|o| o[..5].iter().any(|&w| w != 0)).map(|o| o[..5].to_vec());
             assert_eq!(got.as_deref(), Some(&want[..]), "switch {raw}: {out:x?}");
         }
+
+        // Capped 1M heaps (NVIDIA, `raw_views == 0`): table CBVs still lower to
+        // raw buffer loads directly at the table's dynamic slot (slot 0), with
+        // no raw twin region needed.
+        super::shader::CONSTANTS_RAW_HERE.set(Some(true));
+        super::shader::RAW_VIEWS_HERE.set(Some(0));
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let capped = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        super::shader::CONSTANTS_RAW_HERE.set(None);
+        super::shader::RAW_VIEWS_HERE.set(None);
+
+        let mut capped_dxil = capped.dxil;
+        if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+            v.validate(&mut capped_dxil).unwrap();
+        }
+        for warp in [true, false] {
+            let Ok(host) = super::host::Host::new(warp) else {
+                continue;
+            };
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil: capped_dxil.clone(),
+                user_data: capped.user_data.clone(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: capped.root_cbvs.clone(),
+                root_srvs: capped.root_srvs.clone(),
+                root_uavs: capped.root_uavs.clone(),
+                root_indexed_views: Vec::new(),
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let views = vec![
+                super::host::View::Buffer { data: &data, stride: super::host::Stride::Raw },
+                super::host::View::RawUav(8),
+            ];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![(0, super::host::Root::Constants(vec![s0, 0, 0, 0, 0]))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let got = out.iter().find(|o| o[..5].iter().any(|&w| w != 0)).map(|o| o[..5].to_vec());
+            assert_eq!(got.as_deref(), Some(&want[..]), "capped warp={warp}: {out:x?}");
+        }
     }
 
     #[test]

@@ -3042,6 +3042,11 @@ impl HostHeap {
         }
     }
 
+    /// Whether this heap has raw twins past `self.raw`.
+    pub(crate) fn has_raw_twins(&self) -> bool {
+        self.raw != 0
+    }
+
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory, `size` bytes at `gpu` of `buffer`, which the slot holds.
     ///
@@ -3052,6 +3057,20 @@ impl HostHeap {
     /// lost the device to a page fault in the memory of three freed ones.
     /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+        self.constant_slot_at(index, buffer, gpu, size, false);
+    }
+
+    /// [`HostHeap::constant_at`], or when `raw_only` is true (a capped 1M heap
+    /// without raw twins under `VICTORY_PORT_CBV=1`), a raw SRV directly in
+    /// `index` so translated table CBV loads read the copied bytes.
+    pub(crate) fn constant_slot_at(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        gpu: u64,
+        size: u32,
+        raw_only: bool,
+    ) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
         let Some(host) = host() else { return };
@@ -3059,6 +3078,35 @@ impl HostHeap {
             BufferLocation: gpu,
             SizeInBytes: constant_bytes(size),
         };
+        if raw_only {
+            // SAFETY: a live buffer that holds the range; `gpu` is 256-byte aligned.
+            let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+            let offset = gpu.saturating_sub(base);
+            let bytes = u64::from(desc.SizeInBytes).min(width.saturating_sub(offset)) & !3;
+            if bytes == 0 {
+                null_buffer_view(self.at(index));
+            } else {
+                let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            FirstElement: offset / 4,
+                            NumElements: (bytes / 4) as u32,
+                            StructureByteStride: 0,
+                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        },
+                    },
+                };
+                // SAFETY: a slot of our heap; the range lies in `buffer`.
+                unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), self.at(index)) };
+            }
+            self.put(index);
+            self.clear_twin(index);
+            self.keep(index, holds.then(|| buffer.clone()));
+            return;
+        }
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
             host.device
@@ -3094,14 +3142,16 @@ impl HostHeap {
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
     /// one) show the constant buffer of `size` bytes at `gpu` of `buffer`
-    /// (title memory in place) with nothing copied: its raw twin a raw view
-    /// of those bytes, which translated shaders read; the slot itself a
-    /// constant buffer view of them where that can be (on 256 bytes), else a
-    /// null one. Whether the twin was made (`false`: the caller copies the
-    /// bytes as before).
+    /// (title memory in place) with nothing copied: on uncapped heaps its raw
+    /// twin is a raw view of those bytes and the slot itself a CBV; on capped
+    /// 1M heaps (`self.raw == 0`, NVIDIA) the slot itself is the raw view.
+    /// Whether the view was made (`false`: the caller copies the bytes as before).
     pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
         let Some(host) = host() else { return false };
-        let Some(twin) = self.twin(index) else { return false };
+        let twin = self.twin(index);
+        if twin.is_none() && self.raw != 0 {
+            return false;
+        }
         // SAFETY: a live buffer.
         let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
         let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
@@ -3124,19 +3174,28 @@ impl HostHeap {
                 },
             },
         };
-        let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: if gpu.is_multiple_of(256) { gpu } else { 0 },
-            SizeInBytes: if gpu.is_multiple_of(256) { constant_bytes(size).min(((width - offset) & !255) as u32) } else { 0 },
-        };
-        let cbv = if cbv.SizeInBytes == 0 { D3D12_CONSTANT_BUFFER_VIEW_DESC::default() } else { cbv };
-        // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
-        // zero location makes a null constant buffer view).
-        unsafe {
-            host.device.CreateConstantBufferView(Some(&cbv), self.at(index));
-            self.put(index);
-            host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+        if let Some(twin) = twin {
+            let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                BufferLocation: if gpu.is_multiple_of(256) { gpu } else { 0 },
+                SizeInBytes: if gpu.is_multiple_of(256) { constant_bytes(size).min(((width - offset) & !255) as u32) } else { 0 },
+            };
+            let cbv = if cbv.SizeInBytes == 0 { D3D12_CONSTANT_BUFFER_VIEW_DESC::default() } else { cbv };
+            // SAFETY: slots of our heaps; the ranges lie in the live buffer.
+            unsafe {
+                host.device.CreateConstantBufferView(Some(&cbv), self.at(index));
+                self.put(index);
+                host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+            }
+            self.twin_made(index, true);
+        } else {
+            // Capped 1M heap (NVIDIA): dynamic table CBVs read raw bytes straight from `index`.
+            // SAFETY: a slot of our heap; the range lies in the live buffer.
+            unsafe {
+                host.device.CreateShaderResourceView(buffer, Some(&raw), self.at(index));
+                self.put(index);
+            }
+            self.clear_twin(index);
         }
-        self.twin_made(index, true);
         self.keep(index, Some(buffer.clone()));
         true
     }

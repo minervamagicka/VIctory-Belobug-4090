@@ -43,7 +43,7 @@ pub(crate) fn on() -> bool {
 /// `VICTORY_AB=<s>,VICTORY_PORT_CBV_PLACE` (diagnostics builds) on and off
 /// while the title runs: both sides measured in one run.
 pub(crate) fn in_place_on() -> bool {
-    on() && victory_shader::emit::raw_views() != 0 && crate::toggled!("VICTORY_PORT_CBV_PLACE")
+    on() && crate::toggled!("VICTORY_PORT_CBV_PLACE")
 }
 
 /// Since the last line: tables' constant buffers given in place, their bytes;

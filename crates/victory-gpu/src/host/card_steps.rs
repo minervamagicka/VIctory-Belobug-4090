@@ -118,8 +118,8 @@ const MOST: usize = 12288;
 #[derive(Clone)]
 pub(super) enum FillTo {
     /// A descriptor slot that shows the fill's memory, and nothing else does
-    /// (title heap, slot): it is made to show our buffer instead.
-    Slot(usize, u32),
+    /// (title heap, slot, raw_only): it is made to show our buffer instead.
+    Slot(usize, u32, bool),
     /// A buffer the card can write, filled from its beginning.
     Buffer(ID3D12Resource),
 }
@@ -525,8 +525,8 @@ struct Op {
 enum To {
     /// A host copy, and the title address.
     Copy(Arc<Shadow>, usize),
-    /// A descriptor slot (title heap, slot).
-    Slot(usize, u32),
+    /// A descriptor slot (title heap, slot, raw_only).
+    Slot(usize, u32, bool),
     /// A buffer's beginning.
     Buffer(ID3D12Resource),
 }
@@ -556,7 +556,9 @@ fn record(
         }
     }
     let both = |b: &ID3D12Resource| dests.iter().any(|d| d.as_raw() == b.as_raw());
-    let constants = source | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+    let constants = source
+        | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER
+        | D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
     let mut barriers = vec![transition(between, dest, constants)];
     barriers.extend(sources.iter().map(|b| transition(b, source, if both(b) { dest } else { common })));
     let done: Vec<D3D12_RESOURCE_BARRIER> = dests.iter().map(|b| transition(b, dest, common)).collect();
@@ -764,7 +766,7 @@ impl Host {
                     To::Copy(to, dst)
                 }
                 _ => match fill_to(runs, steps[i]) {
-                    Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
+                    Some(FillTo::Slot(heap, index, raw)) => To::Slot(heap, index, raw),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
                     None => continue,
                 },
@@ -837,11 +839,11 @@ impl Host {
         let parts = if ops.len() < 256 { 1 } else { 8 };
         crate::land::each_under(parts, &|part| {
             for op in &ops {
-                if let To::Slot(heap, index) = &op.to
+                if let To::Slot(heap, index, raw) = &op.to
                     && *index as usize / 4 % parts == part
                 {
                     // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32, *raw);
                 }
             }
         });
